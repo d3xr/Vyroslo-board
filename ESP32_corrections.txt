@@ -1,0 +1,90 @@
+ТЗ — ПРОШИВКА (тонкий, ESP32) v2: манифест + WS-управление + совместимость с сервером Vyroslo
+
+Роль: ты — AI-агент прошивки ESP32. Реализуй публикацию манифеста устройства, работу телеметрии/конфига/heartbeat и управление по WebSocket в соответствии с актуальной серверной спецификацией.
+
+База:
+- HOST=https://vyroslo.replit.app
+- WS=wss://vyroslo.replit.app/ws
+- Auth: POST /api/v1/device/auth → ответ содержит "token" (строгое имя поля). Храни token и срок истечения в NVS.
+- NVS: jwt_token, jwt_exp, config_etag, manifest_etag, manifest_last_put_ms.
+
+Политика 401/429 (важно):
+- 401 на /api/v1/device/auth (неверный secret) → authBlocked до ребута/ручного OFF→ON.
+- 401 на других эндпойнтах (протухший/невалидный JWT) → немедленная пере-авторизация и повтор запроса (без «кирпича»).
+- 429: соблюдаем заголовок Retry-After (секунды или дата) + экспоненциальный бэкофф с jitter 0–3 c. Не превышать лимиты.
+
+Манифест устройства:
+- Локально формируй JSON:
+  {
+    "schema":"1.0",
+    "device":{"id":"<device_id>","hw":"ESP32-Wroom-32","fw":"<fw_ver>","i2c":{"bus0":{...},"bus1":{...}}},
+    "sensors":{"air":[...],"soil":[...],"water":{...}},
+    "relays":[{"id":"pump","gpio":13,"active":"low","type":"pump"}, ...],
+    "multiplexer":{"type":"CD74HC4067","pins":{"signal":34,"s0":21,"s1":19,"s2":18,"s3":5},"channels_used":[0,1,2,14]},
+    "display":{"type":"SSD1306","resolution":"128x64"},
+    "controls":{"encoder":{"clk":15,"dt":2,"sw":4}}
+  }
+- Канонизируй порядок ключей при отправке. Истинный ETag даёт сервер.
+
+Синхронизация манифеста:
+1) После успешного /auth:
+   - GET /api/v1/device/manifest c If-None-Match: <manifest_etag или пусто>.
+     • 200 → при смысловых отличиях локальной и серверной версии выполни PUT; сохрани ETag из заголовка.
+     • 304 → ничего не делай.
+     • 404 → выполни PUT.
+   - PUT /api/v1/device/manifest с локальным JSON.
+     • 200 → сохранить ETag и manifest_last_put_ms; обработать warnings[] (лог).
+     • 400/429 → общая политика ошибок/бэкоффа.
+   - Переотправляй PUT при локальных изменениях (пины/датчики/имена). Фоновый GET c If-None-Match не чаще 1/24ч.
+
+Конфиг:
+- GET /api/v1/device/config каждые ~60 c с If-None-Match: <config_etag>.
+  • 200 → применить, сохранить ETag из заголовка.
+  • 304 → без изменений.
+- Параметры из конфига (если заданы): telemetry_sec, config_sec, ws_reconnect_sec, schedules[], thresholds{}, soil_channels[].
+
+Телеметрия:
+- POST /api/v1/device/telemetry каждые ~10 c (или telemetry_sec из конфига).
+- Формат (канон): { "device_id":"<id>", "ts_ms": 1736723456000, "fw":"<fw>", "hw":"ESP32-Wroom-32",
+  "sensors":{"air":{"t_c":24.36,"rh":58.2}, "soil":[{"id":1,"wet":true},...], "water":{"present":true}},
+  "relays":[{"id":"R1","state":true,"on_sec":125},...], "rssi_dbm":-62, "uptime_sec":123456 }
+- При 401 → ре-логин и повтор; при 429 → ждать Retry-After + бэкофф.
+
+Heartbeat:
+- HEAD /api каждые 2–5 c (без JWT). POST /api/v1/device/heartbeat опционально ≤4/мин.
+
+WebSocket управление:
+- Поднимать: wss://vyroslo.replit.app/ws?token=<JWT>, реконнект 5 c.
+- Входящие команды (канон):
+  { "type":"relay_control", "cmd_id":"<uuid>", "actions":[ {"relay":"pump","state":true,"timeout_sec":600}, ... ] }
+  { "type":"config_update", "cmd_id":"<uuid>" }
+- Действия:
+  • Для каждого action сопоставить relay.id → gpio/active из локального манифеста и выполнить.
+  • Если задан timeout_sec — запустить авто-выключение.
+  • На каждую команду отправлять ACK:
+    { "type":"ack","cmd_id":"<uuid>","status":"ok","ts":<epoch_ms> } (status="error" + error_msg при сбое).
+- Поддержи временно и одиночный формат (compat): { "type":"relay_control","cmd_id":"...","relay_id":"...","state":true,"duration_ms":30000 } → заверни в actions[].
+
+Fallback (если сервер включит /inbox):
+- При отсутствии WS раз в 5 c делай GET /api/v1/device/inbox (Bearer).
+- Выполняй команды; ACK — через WS при восстановлении или POST /api/v1/device/ack (если сервер предоставит).
+- Если /inbox вернул 404 — отключи fallback до перезапуска/тайм-решолва.
+
+LED-индикация:
+- Зелёный — online (WS подключён), зелёный мигающий — реконнект WS.
+- Жёлтый — ожидание по Retry-After/бэкофф.
+- Красный — authBlocked (401 на /auth).
+
+Лимиты (не превышать):
+- auth ≤5/мин, telemetry ≤12/мин, config ≤2/мин, heartbeat-POST ≤4/мин, manifest ≤1/мин, WS reconnect 5 c.
+
+Журналирование (минимум):
+- auth ok/401, reauth, 429 + Retry-After, WS connect/disconnect, relay actions, ACK, apply config, PUT/GET manifest + ETag.
+
+Критерии приёмки:
+1) Токен протух → 401 на телеметрии → мгновенная пере-авторизация и успешный повтор.
+2) Неверный secret → 401 на /auth → устройство уходит в authBlocked (LED=красный).
+3) Манифест: GET=404 → PUT=200 + ETag → следующий GET If-None-Match=304.
+4) WS: relay_control (actions[]) с timeout_sec → выполнено, авто-выключено, ACK ≤5 c.
+5) /config: 304 при неизменности; 200 + ETag при изменении; параметры применяются.
+6) 429 на любой из эндпойнтов с Retry-After=10 → ожидание ≈10 c + jitter и успешный повтор.

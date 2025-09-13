@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pio run:*)",
+      "Bash(pio lib install:*)",
+      "Bash(platformio lib install:*)",
+      "Bash(\"C:\\Users\\d3xr\\.platformio\\penv\\Scripts\\platformio.exe\" lib install \"adafruit/Adafruit SHT31 Library\")",
+      "Bash(\"C:\\Users\\d3xr\\.platformio\\penv\\Scripts\\platformio.exe\" lib install \"bblanchon/ArduinoJson\")",
+      "Bash(\"C:\\Users\\d3xr\\.platformio\\penv\\Scripts\\platformio.exe\" run)",
+      "Bash(\"C:\\Users\\d3xr\\.platformio\\penv\\Scripts\\platformio.exe\" lib install \"adafruit/Adafruit SSD1306\")",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
