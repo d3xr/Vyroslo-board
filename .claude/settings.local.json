@@ -10,7 +10,11 @@
       "Bash(\"C:\\Users\\d3xr\\.platformio\\penv\\Scripts\\platformio.exe\" lib install \"adafruit/Adafruit SSD1306\")",
       "Bash(git add:*)",
       "Bash(git config:*)",
-      "Bash(git init:*)"
+      "Bash(git init:*)",
+      "Bash(git commit:*)",
+      "Bash(gh repo create:*)",
+      "Bash(git remote add:*)",
+      "Bash(git branch:*)"
     ],
     "deny": [],
     "ask": []
