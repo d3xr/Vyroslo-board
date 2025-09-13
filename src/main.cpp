@@ -133,7 +133,7 @@ Adafruit_SHT31 sht45 = Adafruit_SHT31(); // 0x45
 bool have44=false, have45=false;
 
 // ---------------- UI State ----------------
-enum UiState { UI_HOME, UI_MENU, UI_RELAYS, UI_SENSORS, UI_SOIL, UI_SERVER, UI_SERVER_TEST_RESULT };
+enum UiState { UI_HOME, UI_MENU, UI_RELAYS, UI_SENSORS, UI_SOIL, UI_SERVER, UI_SERVER_TEST_SENDING, UI_SERVER_TEST_RESULT };
 UiState ui = UI_HOME;
 int menuIndex = 0;
 const char* mainMenuItems[] = {"Relays","Sensors","Soil","Server","Exit"};
@@ -428,6 +428,24 @@ static void drawServer() {
   display.display();
 }
 static String testResultStr;
+static unsigned long testStartTime = 0;
+static bool testBlockInput = false;
+static void drawServerTestSending() {
+  display.clearDisplay();
+  drawHeader("TEST AUTH");
+  int y = CONTENT_TOP + 10;
+  display.setCursor(0, y); y+=LINE_H;
+  display.print("Connecting to server...");
+  display.setCursor(0, y); y+=LINE_H;
+  display.print("Sending auth request");
+
+  // Simple animation
+  int dots = (millis() / 500) % 4;
+  for(int i = 0; i < dots; i++) display.print(".");
+
+  display.display();
+}
+
 static void drawServerTestResult() {
   display.clearDisplay();
   drawHeader("TEST RESULT");
@@ -435,11 +453,21 @@ static void drawServerTestResult() {
   display.setCursor(0, y); y+=LINE_H;
   display.print("POST /api/.../auth");
   display.setCursor(0, y); y+=LINE_H;
-  display.print("Resp:");
+  display.print("Response:");
   display.setCursor(0, y); y+=LINE_H;
-  const int maxLen = 120;
+  const int maxLen = 100;
   String s = testResultStr.length()>maxLen ? testResultStr.substring(0,maxLen)+"..." : testResultStr;
   display.print(s);
+
+  // Show instructions
+  y = SCREEN_H - LINE_H - 2;
+  display.setCursor(0, y);
+  if (!testBlockInput) {
+    display.print("Long press to exit");
+  } else {
+    display.print("Wait 3 sec...");
+  }
+
   display.display();
 }
 static void drawSoil() {
@@ -795,9 +823,10 @@ void loop() {
         if (serverMenuSel == 0) { serverEnable(true);  drawServer(); }   // ON
         else if (serverMenuSel == 1) { serverEnable(false); drawServer(); } // OFF
         else if (serverMenuSel == 2) {
-          wifiConnectAndReport();
-          String jwt; (void)tryAuthenticateOnce(jwt);
-          ui = UI_SERVER_TEST_RESULT; drawServerTestResult();
+          ui = UI_SERVER_TEST_SENDING;
+          testStartTime = millis();
+          testBlockInput = false;
+          drawServerTestSending();
         }
       } else if (bev == BTN_LONG) {
         ui = UI_MENU; firstEnter = true; drawMenu();
@@ -805,8 +834,37 @@ void loop() {
       if (millis() - lastDrawMs > 1000) { drawServer(); lastDrawMs = millis(); }
     } break;
 
+    case UI_SERVER_TEST_SENDING:
+      // Block input during sending
+      if (millis() - testStartTime > 500) {
+        // After 500ms animation, do the actual request
+        wifiConnectAndReport();
+        String jwt;
+        (void)tryAuthenticateOnce(jwt);
+        ui = UI_SERVER_TEST_RESULT;
+        testStartTime = millis();
+        testBlockInput = true;
+        drawServerTestResult();
+      } else {
+        // Show animation while waiting
+        drawServerTestSending();
+      }
+      break;
+
     case UI_SERVER_TEST_RESULT:
-      if (bev == BTN_LONG) { ui = UI_SERVER; drawServer(); }
+      // Check if 3 seconds have passed since result shown
+      if (testBlockInput && millis() - testStartTime >= 3000) {
+        testBlockInput = false;
+      }
+
+      // Only allow long press exit after 3 seconds
+      if (!testBlockInput && bev == BTN_LONG) {
+        ui = UI_SERVER;
+        drawServer();
+      } else if (testBlockInput || millis() % 1000 < 500) {
+        // Redraw result periodically or when blocking input
+        drawServerTestResult();
+      }
       break;
   }
 
