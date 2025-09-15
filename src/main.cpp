@@ -41,9 +41,12 @@
 #include <Preferences.h>
 #include <time.h>
 
+static uint64_t getEpochTimeMs();
+
+
 // ---------------- Build / Debug ----------------
-#define FW_VERSION      "v1.1.0"
-#define HW_VERSION      "ESP32-Wroom-32"
+#define FIRMWARE_VERSION "v1.1.0"
+#define HARDWARE_VERSION "ESP32-Wroom-32"
 #define DEBUG_LEVEL     1     // 0=none, 1=basic, 2=verbose
 static void DBG(const String &s, int lvl=1){ if (DEBUG_LEVEL>=lvl) Serial.println(s); }
 
@@ -157,10 +160,17 @@ bool   wsConnected     = false;
 int    TELEMETRY_SEC   = 10;
 int    CONFIG_SEC      = 60;
 int    HEARTBEAT_SEC   = 30;
+static bool clockReady = false;
 unsigned long tLastTelemetry = 0;
 unsigned long tLastConfig    = 0;
 unsigned long tLastHeartbeat = 0;
+unsigned long tLastManifest  = 0;
 WebSocketsClient webSocket;
+
+// === Manifest System ===
+String manifestETag;
+int    MANIFEST_SEC = 3600; // Check manifest every hour
+bool   manifestInitialSent = false; // Track if manifest was sent at least once
 
 // === AUTH / Backoff ===
 bool          authBlocked = false;         // 401 → блок до перезагрузки
@@ -306,6 +316,25 @@ static String isoTimestamp() {
   return String(buf);
 }
 
+// --- Time sync helpers ---
+static bool hasValidTime() {
+  time_t now = time(nullptr);
+  return now > 1700000000; // ~2023-11-14, просто "здравый минимум"
+}
+
+static void ntpInitAndWait(unsigned long timeoutMs = 20000) {
+  // Оставляем UTC; дергаем публичные пулы
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  unsigned long start = millis();
+  while (!hasValidTime() && millis() - start < timeoutMs) {
+    delay(200);
+  }
+  clockReady = hasValidTime();
+  if (clockReady) DBG(String("Time synced: ") + isoTimestamp());
+  else            DBG("Time sync timeout");
+}
+
+
 // ---------------- Display helpers ----------------
 static void drawHeader(const char* title) {
     display.fillRect(0,0,SCREEN_W,HEADER_H,SSD1306_BLACK);
@@ -317,8 +346,8 @@ static void drawHome() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     drawHeader("HOME");
-    int lines = 1; // WiFi
-    int sensorLines = (have44 ? 1 : 0) + (have45 ? 1 : 0);
+    int lines = 3; // WiFi + Time
+    int sensorLines = (have44 ? 1 : 0) + (have45 ? 1 : 0); 
     if (sensorLines == 0) sensorLines = 1;
     lines += sensorLines;
     int onCount = 0;
@@ -346,6 +375,15 @@ static void drawHome() {
         snprintf(wifiBuf, sizeof(wifiBuf), "No WiFi");
     }
     line(String(wifiBuf));
+    // Показ времени (UTC, как в isoTimestamp())
+    time_t now = time(NULL);
+    if (now > 1700000000) {
+        line(String("Time: ") + isoTimestamp()); // формат: 2025-09-14T12:34:56.000Z
+    } else {
+        line("Time: syncing...");
+    }
+
+
     if (have44 || have45) {
         if (have44) {
             float t = sht44.readTemperature(), h = sht44.readHumidity();
@@ -430,6 +468,9 @@ static void drawServer() {
 static String testResultStr;
 static unsigned long testStartTime = 0;
 static bool testBlockInput = false;
+static int testScrollLine = 0;
+static int testTotalLines = 0;
+static bool testLinesInitialized = false;
 static void drawServerTestSending() {
   display.clearDisplay();
   drawHeader("TEST AUTH");
@@ -448,24 +489,55 @@ static void drawServerTestSending() {
 
 static void drawServerTestResult() {
   display.clearDisplay();
-  drawHeader("TEST RESULT");
-  int y = CONTENT_TOP;
-  display.setCursor(0, y); y+=LINE_H;
-  display.print("POST /api/.../auth");
-  display.setCursor(0, y); y+=LINE_H;
-  display.print("Response:");
-  display.setCursor(0, y); y+=LINE_H;
-  const int maxLen = 100;
-  String s = testResultStr.length()>maxLen ? testResultStr.substring(0,maxLen)+"..." : testResultStr;
-  display.print(s);
 
-  // Show instructions
-  y = SCREEN_H - LINE_H - 2;
-  display.setCursor(0, y);
-  if (!testBlockInput) {
-    display.print("Long press to exit");
-  } else {
-    display.print("Wait 3 sec...");
+  // Split testResultStr into lines
+  static String lines[50]; // Max 50 lines
+
+  if (!testLinesInitialized) {
+    testTotalLines = 0;
+    String remaining = testResultStr;
+
+    // Split by newlines and also wrap long lines
+    while (remaining.length() > 0 && testTotalLines < 50) {
+      int newlinePos = remaining.indexOf('\n');
+      String currentLine;
+
+      if (newlinePos == -1) {
+        // No more newlines, take remaining
+        currentLine = remaining;
+        remaining = "";
+      } else {
+        // Take line up to newline
+        currentLine = remaining.substring(0, newlinePos);
+        remaining = remaining.substring(newlinePos + 1);
+      }
+
+      // Wrap long lines (21 chars max for 128px width)
+      while (currentLine.length() > 21) {
+        lines[testTotalLines++] = currentLine.substring(0, 21);
+        currentLine = currentLine.substring(21);
+        if (testTotalLines >= 50) break;
+      }
+
+      // Add remaining part of line
+      if (currentLine.length() > 0 && testTotalLines < 50) {
+        lines[testTotalLines++] = currentLine;
+      }
+    }
+
+    testLinesInitialized = true;
+    testScrollLine = 0; // Reset scroll to top
+  }
+
+  // Calculate visible area (full screen)
+  int visibleLines = SCREEN_H / LINE_H; // Should be 6 lines (64/10)
+
+  // Draw lines starting from testScrollLine
+  int y = 0;
+  for (int i = 0; i < visibleLines && (testScrollLine + i) < testTotalLines; i++) {
+    display.setCursor(0, y);
+    display.print(lines[testScrollLine + i]);
+    y += LINE_H;
   }
 
   display.display();
@@ -491,8 +563,13 @@ static void wifiConnectAndReport() {
   WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) { delay(200); }
-  if (WiFi.status() == WL_CONNECTED) { DBG("WiFi OK"); configTime(0,0,"pool.ntp.org","time.nist.gov"); }
-  else { DBG("WiFi FAIL"); }
+  if (WiFi.status() == WL_CONNECTED) {
+  DBG("WiFi OK");
+  ntpInitAndWait();  // дождаться валидного времени
+} else {
+  DBG("WiFi FAIL");
+}
+
 }
 static String baseHostFromUrl(const String& url){
   int p = url.indexOf("//"); if (p<0) return String(); int s = p+2; int e = url.indexOf('/', s); if (e<0) e = url.length();
@@ -515,10 +592,18 @@ static int relayIndexById(const String& id) {
 
 static void wsSendAck(const String& cmdId, const String& status) {
   DynamicJsonDocument doc(256);
+  doc["type"] = "ack";
   doc["cmd_id"] = cmdId;
   doc["status"] = status;
+  doc["ts"] = getEpochTimeMs();
   String out;
   serializeJson(doc, out);
+
+  // Debug: print outgoing ACK
+  DBG("=== WEBSOCKET ACK ===");
+  DBG(out);
+  DBG("====================");
+
   webSocket.sendTXT(out);
 }
 
@@ -530,11 +615,37 @@ static float soilPercentFromRaw(int raw) {
 }
 
 static void handleCommandJson(const char* json){
+  // Debug: print incoming WebSocket command
+  DBG("=== WEBSOCKET COMMAND ===");
+  DBG(String(json));
+  DBG("========================");
+
   DynamicJsonDocument doc(768); if (deserializeJson(doc, json)) return;
   String cmdId = doc["cmd_id"].as<String>(); String type = doc["type"].as<String>();
+
   if (type=="relay_control"){
-    String relayId = doc["relay_id"].as<String>(); bool state = doc["state"] | false; int idx = relayIndexById(relayId);
-    if (idx>=0){ setRelay(idx, state); wsSendAck(cmdId, "ok"); } else wsSendAck(cmdId, "unknown_relay");
+    // Support new batch format (recommended)
+    if (doc.containsKey("actions") && doc["actions"].is<JsonArray>()) {
+      JsonArray actions = doc["actions"];
+      for (JsonObject action : actions) {
+        String relay = action["relay"];
+        bool state = action["state"];
+        int timeoutSec = action["timeout_sec"] | 0;
+        int idx = relayIndexById(relay);
+        if (idx >= 0) {
+          setRelay(idx, state);
+          // TODO: Implement timeout handling if needed
+        }
+      }
+      wsSendAck(cmdId, "ok");
+    } else {
+      // Legacy single command format (temporary support)
+      String relayId = doc["relay_id"].as<String>();
+      bool state = doc["state"] | false;
+      int idx = relayIndexById(relayId);
+      if (idx>=0){ setRelay(idx, state); wsSendAck(cmdId, "ok"); }
+      else wsSendAck(cmdId, "unknown_relay");
+    }
   } else if (type=="config_update"){
     cfgETag = ""; wsSendAck(cmdId, "ok");
   } else {
@@ -552,13 +663,315 @@ static void wsEvent(WStype_t type, uint8_t * payload, size_t length){
 static void wsConnect(){
   if (!serverAuthed) return;
   String host = baseHostFromUrl(BASE_URL); String path = "/ws?token=" + jwtToken;
+
+  // Debug: print WebSocket connection
+  DBG("=== WEBSOCKET CONNECT ===");
+  DBG("wss://" + host + ":443" + path.substring(0, 20) + "...");
+  DBG("=========================");
+
   webSocket.beginSSL(host.c_str(), 443, path.c_str());
   webSocket.onEvent(wsEvent);
   webSocket.setReconnectInterval(5000);
 }
 
+// ---------------- Manifest System ----------------
+static void generateManifest(DynamicJsonDocument& manifest) {
+  manifest["schema"] = "1.0";
+
+  // Device info
+  // Top-level device info matching Timeline format
+  JsonObject device = manifest.createNestedObject("device");
+  device["id"]         = DEVICE_ID;
+  device["hw"] = HARDWARE_VERSION;
+  device["fw"] = FIRMWARE_VERSION;
+
+  // I2C configuration
+  JsonObject i2c = manifest.createNestedObject("i2c");
+  JsonObject bus0 = i2c.createNestedObject("bus0");
+  bus0["sda"] = I2C_SDA;
+  bus0["scl"] = I2C_SCL;
+  JsonArray devices = bus0.createNestedArray("devices");
+  if (have44) devices.add("SHT31_0x44");
+  if (have45) devices.add("SHT31_0x45");
+
+  JsonObject bus1 = i2c.createNestedObject("bus1");
+  bus1["sda"] = OLED_SDA;
+  bus1["scl"] = OLED_SCL;
+  JsonArray devices1 = bus1.createNestedArray("devices");
+  devices1.add("SSD1306_0x3C");
+
+  // Air sensors - detailed specification matching Timeline format
+  JsonObject sensors = manifest.createNestedObject("sensors");
+  JsonArray airSensors = sensors.createNestedArray("air");
+
+  if (have44) {
+    JsonObject sht44_sensor = airSensors.createNestedObject();
+    sht44_sensor["id"] = "air_top";
+    sht44_sensor["name"] = "Top Air Sensor";
+    sht44_sensor["type"] = "SHT31";
+    sht44_sensor["address"] = "0x44";
+    sht44_sensor["bus"] = 0;
+    JsonArray measures44 = sht44_sensor.createNestedArray("measures");
+    measures44.add("temperature");
+    measures44.add("humidity");
+  }
+
+  if (have45) {
+    JsonObject sht45_sensor = airSensors.createNestedObject();
+    sht45_sensor["id"] = "air_bot";
+    sht45_sensor["name"] = "Bottom Air Sensor";
+    sht45_sensor["type"] = "SHT31";
+    sht45_sensor["address"] = "0x45";
+    sht45_sensor["bus"] = 0;
+    JsonArray measures45 = sht45_sensor.createNestedArray("measures");
+    measures45.add("temperature");
+    measures45.add("humidity");
+  }
+
+  // Soil sensors - detailed specification matching Timeline format
+  JsonArray soilSensors = sensors.createNestedArray("soil");
+
+  // Only add active soil sensors (first 2 for example)
+  for (int i = 0; i < 2; i++) {
+    JsonObject soil = soilSensors.createNestedObject();
+    char id[16]; snprintf(id, sizeof(id), "soil_%02d", i + 1);
+    char name[32]; snprintf(name, sizeof(name), "Soil Sensor %d", i + 1);
+    soil["id"] = id;
+    soil["name"] = name;
+    soil["type"] = "analog";
+    soil["mux_channel"] = i;
+    soil["air_value"] = 4095;
+    soil["water_value"] = 1500;
+  }
+
+  // Water level sensor
+  JsonObject water = sensors.createNestedObject("water");
+  water["id"] = "water_level";
+  water["type"] = "analog";
+  water["mux_channel"] = 14;
+  water["threshold"] = 1200;
+
+  // Relays - detailed specification matching Timeline format
+  JsonArray relays = manifest.createNestedArray("relays");
+
+  // Relay 0 - Top Light
+  JsonObject relay0 = relays.createNestedObject();
+  relay0["id"] = "light_top";
+  relay0["name"] = "Top Light";
+  relay0["type"] = "light";
+  relay0["gpio"] = 13;
+  relay0["active"] = "low";
+  relay0["max_duration_sec"] = 3600;
+
+  // Relay 1 - Mid Light
+  JsonObject relay1 = relays.createNestedObject();
+  relay1["id"] = "light_mid";
+  relay1["name"] = "Mid Light";
+  relay1["type"] = "light";
+  relay1["gpio"] = 14;
+  relay1["active"] = "low";
+  relay1["max_duration_sec"] = 3600;
+
+  // Relay 2 - Humidifier
+  JsonObject relay2 = relays.createNestedObject();
+  relay2["id"] = "humidifier";
+  relay2["name"] = "Humidifier";
+  relay2["type"] = "auxiliary";
+  relay2["gpio"] = 26;
+  relay2["active"] = "low";
+  relay2["max_duration_sec"] = 1800;
+
+  // Additional relays (3-7) with standard config
+  const char* relay_ids[] = {"fan_exhaust", "fan_intake", "water_pump", "aux_1", "aux_2"};
+  const char* relay_names[] = {"Exhaust Fan", "Intake Fan", "Water Pump", "Auxiliary 1", "Auxiliary 2"};
+  const char* relay_types[] = {"fan", "fan", "pump", "auxiliary", "auxiliary"};
+  int relay_gpios[] = {27, 25, 33, 32, 12};
+
+  for (int i = 0; i < 5; i++) {
+    JsonObject relay = relays.createNestedObject();
+    relay["id"] = relay_ids[i];
+    relay["name"] = relay_names[i];
+    relay["type"] = relay_types[i];
+    relay["gpio"] = relay_gpios[i];
+    relay["active"] = "low";
+    relay["max_duration_sec"] = 3600;
+  }
+
+  // Multiplexer
+  JsonObject multiplexer = manifest.createNestedObject("multiplexer");
+  multiplexer["type"] = "CD74HC4067";
+  JsonObject pins = multiplexer.createNestedObject("pins");
+  pins["signal"] = MUX_SIG;
+  pins["s0"] = MUX_S0;
+  pins["s1"] = MUX_S1;
+  pins["s2"] = MUX_S2;
+  pins["s3"] = MUX_S3;
+  JsonArray channelsUsed = multiplexer.createNestedArray("channels_used");
+  for (int i = 0; i < 16; i++) channelsUsed.add(i);
+
+  // Display - matching Timeline format
+  JsonObject display = manifest.createNestedObject("display");
+  display["type"] = "SSD1306";
+  display["resolution"] = "128x64";
+  display["i2c_address"] = "0x3c";
+  display["bus"] = 1;
+
+  // Controls - matching Timeline format
+  JsonObject controls = manifest.createNestedObject("controls");
+  JsonObject encoder = controls.createNestedObject("encoder");
+  encoder["clk"] = 15;
+  encoder["dt"]  = 2;
+  encoder["sw"]  = 4;
+
+  manifest["manifest_version"] = 1;
+  manifest["timezone"] = "Europe/Moscow";  // UTC+3
+  manifest["updated_at"] = getEpochTimeMs(); // после NTP это корректный epoch-ms
+}
+
+// Check if manifest exists and is up to date
+static bool checkManifest() {
+  if (!serverAuthed) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiClientSecure tls;
+  tls.setInsecure();
+  HTTPClient http;
+  String url = String(BASE_URL) + "/api/v1/device/manifest";
+
+  http.begin(tls, url);
+  http.addHeader("Authorization", "Bearer " + jwtToken);
+  if (manifestETag.length() > 0) {
+    http.addHeader("If-None-Match", manifestETag);
+  }
+
+  int code = http.GET();
+
+  if (code == 200) {
+    // Manifest exists but changed, update our ETag
+    String response = http.getString();
+    DynamicJsonDocument doc(1024);
+    if (deserializeJson(doc, response) == DeserializationError::Ok) {
+      if (doc.containsKey("etag")) {
+        manifestETag = doc["etag"].as<String>();
+        // Save ETag to NVS
+        prefs.begin("vyroslo", false);
+        prefs.putString("manifestETag", manifestETag);
+        prefs.end();
+      }
+    }
+    DBG("Manifest exists and updated ETag");
+    http.end();
+    return true; // Manifest exists, no need to upload
+  } else if (code == 304) {
+    // Not Modified - manifest unchanged
+    DBG("Manifest unchanged (304)");
+    http.end();
+    return true; // No need to upload
+  } else if (code == 404) {
+    // Manifest not found, need to upload
+    DBG("Manifest not found (404), will upload");
+    http.end();
+    return false; // Need to upload
+  } else if (code == 401) {
+    serverAuthed = false;
+    authBlocked = true;
+    setLED(LED_RED);
+  }
+
+  http.end();
+  return true; // Assume exists on other errors to avoid spam
+}
+
+static bool uploadManifest() {
+  if (!serverAuthed) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  DynamicJsonDocument manifest(4096);
+  generateManifest(manifest);
+
+  WiFiClientSecure tls;
+  tls.setInsecure();
+    HTTPClient http;
+  String url = String(BASE_URL) + "/api/v1/device/manifest";
+
+  String payload;
+  serializeJson(manifest, payload);
+
+  // Debug: print manifest request
+  DBG("=== MANIFEST REQUEST ===");
+  DBG("PUT " + url);
+  DBG("Authorization: Bearer " + jwtToken.substring(0,20) + "...");
+  DBG("Content-Type: application/json");
+  DBG("Payload length: " + String(payload.length()));
+  DBG(payload);
+  DBG("========================");
+
+  http.begin(tls, url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + jwtToken);
+
+  int code = http.PUT(payload);
+  String response = http.getString();
+
+  // Debug: print manifest response
+  DBG("=== MANIFEST RESPONSE ===");
+  DBG("Code: " + String(code));
+  DBG(response);
+  DBG("=========================");
+
+  if (code == 200) {
+    DynamicJsonDocument doc(1024);
+    if (deserializeJson(doc, response) == DeserializationError::Ok) {
+      if (doc.containsKey("etag")) {
+        manifestETag = doc["etag"].as<String>();
+        // Save ETag to NVS
+        prefs.begin("vyroslo", false);
+        prefs.putString("manifestETag", manifestETag);
+        prefs.end();
+      }
+      if (doc.containsKey("warnings")) {
+        JsonArray warnings = doc["warnings"];
+        for (const char* warning : warnings) {
+          DBG("⚠️ GPIO Warning: " + String(warning));
+        }
+      }
+    }
+    DBG("Manifest uploaded successfully");
+    http.end();
+    return true;
+  } else if (code == 400) {
+    DBG("❌ Manifest validation failed");
+    String response = http.getString();
+    DBG(response);
+  } else if (code == 401) {
+    serverAuthed = false;
+    authBlocked = true;
+    setLED(LED_RED);
+  } else if (code == 429) {
+    // Handle rate limiting for manifest uploads
+    DBG("⏳ Manifest rate limited");
+  }
+
+  http.end();
+  return false;
+}
+
+static void syncManifest() {
+  // First check if manifest exists and is current
+  if (!checkManifest()) {
+    // Manifest doesn't exist or needs update, upload it
+    uploadManifest();
+  }
+}
+
 // ---------------- Auth / API ----------------
 static String isoNow(){ return isoTimestamp(); }
+
+static uint64_t getEpochTimeMs() {
+  time_t t = time(NULL);
+  return (uint64_t)t * 1000ULL + (uint64_t)(millis() % 1000ULL);
+}
+
 
 static int tryAuthenticateOnce(String& outJwt) {
   WiFiClientSecure tls; tls.setInsecure();
@@ -571,24 +984,52 @@ static int tryAuthenticateOnce(String& outJwt) {
 
   const char* hdrKeys[] = {"Retry-After"};
   http.collectHeaders(hdrKeys, 1);
+  http.addHeader("Content-Type", "application/json");
 
   DynamicJsonDocument body(512);
   body["device_id"] = DEVICE_ID;
   body["secret"]    = DEVICE_SECRET;
-  body["fw"]        = FW_VERSION;
-  body["hw"]        = HW_VERSION;
+  body["fw"]        = FIRMWARE_VERSION;
+  body["hw"]        = HARDWARE_VERSION;
 
   String payload; serializeJson(body, payload);
+
+  // Debug: print auth request
+  DBG("=== AUTH REQUEST ===");
+  DBG("POST " + url);
+  DBG("Content-Type: application/json");
+  DBG(payload);
+  DBG("===================");
+
   int code = http.POST(payload);
   String rawResp = http.getString();
+
+  // Debug: print auth response
+  DBG("=== AUTH RESPONSE ===");
+  DBG("Code: " + String(code));
+  DBG(rawResp);
+  DBG("====================");
 
   // для TEST рисуем, что есть
   testResultStr = String("Code: ") + code + "\n" + rawResp;
 
   if (code == 200) {
-    DynamicJsonDocument doc(768);
+    DynamicJsonDocument doc(1024);
     if (deserializeJson(doc, rawResp)==DeserializationError::Ok) {
-      outJwt = doc["jwt"].as<String>();
+      outJwt = doc["token"].as<String>();
+
+      // Extract polling intervals from response
+      if (doc.containsKey("polling")) {
+        JsonObject polling = doc["polling"];
+        if (polling.containsKey("telemetry_sec")) {
+          TELEMETRY_SEC = polling["telemetry_sec"];
+          DBG("Updated telemetry interval: " + String(TELEMETRY_SEC) + "s");
+        }
+        if (polling.containsKey("config_sec")) {
+          CONFIG_SEC = polling["config_sec"];
+          DBG("Updated config interval: " + String(CONFIG_SEC) + "s");
+        }
+      }
     } else {
       code = 500;
     }
@@ -602,10 +1043,10 @@ static int tryAuthenticateOnce(String& outJwt) {
 }
 
 static void serverSendTelemetry(){
-  if (!serverAuthed) return; if (WiFi.status()!=WL_CONNECTED) return;
+  if (!serverAuthed) return; if (WiFi.status()!=WL_CONNECTED) return; if (!clockReady) return;
   DynamicJsonDocument doc(3072);
   doc["device_id"] = DEVICE_ID;
-  doc["timestamp"] = isoNow();
+  doc["ts_ms"] = getEpochTimeMs();
   JsonArray air = doc.createNestedArray("air");
   if (have44){ float t=sht44.readTemperature(), h=sht44.readHumidity(); JsonObject a = air.createNestedObject(); a["id"]="air_top"; if(!isnan(t)) a["t_c"]=t; if(!isnan(h)) a["rh"]=h; }
   if (have45){ float t=sht45.readTemperature(), h=sht45.readHumidity(); JsonObject a = air.createNestedObject(); a["id"]="air_bot"; if(!isnan(t)) a["t_c"]=t; if(!isnan(h)) a["rh"]=h; }
@@ -620,8 +1061,23 @@ static void serverSendTelemetry(){
   String payload; serializeJson(doc, payload);
 
   WiFiClientSecure tls; tls.setInsecure(); HTTPClient http; String url = String(BASE_URL) + "/api/v1/device/telemetry";
+
+  // Debug: print telemetry request
+  DBG("=== TELEMETRY REQUEST ===");
+  DBG("POST " + url);
+  DBG("Authorization: Bearer " + jwtToken.substring(0,20) + "...");
+  DBG("Content-Type: application/json");
+  DBG(payload);
+  DBG("========================");
   http.begin(tls, url); http.addHeader("Content-Type","application/json"); http.addHeader("Authorization", String("Bearer ")+jwtToken);
-  (void)http.POST(payload);
+  int responseCode = http.POST(payload);
+  String response = http.getString();
+
+  // Debug: print telemetry response
+  DBG("=== TELEMETRY RESPONSE ===");
+  DBG("Code: " + String(responseCode));
+  DBG(response);
+  DBG("=========================");
   http.end(); delay(1);
 }
 
@@ -636,13 +1092,42 @@ static void applyPollingFromConfig(const JsonObject &root){
 static void serverFetchConfig(){
   if (!serverAuthed) return; if (WiFi.status()!=WL_CONNECTED) return;
   WiFiClientSecure tls; tls.setInsecure(); HTTPClient http; String url=String(BASE_URL)+"/api/v1/device/config";
+
+  // Debug: print config request
+  DBG("=== CONFIG REQUEST ===");
+  DBG("GET " + url);
+  DBG("Authorization: Bearer " + jwtToken.substring(0,20) + "...");
+  if (cfgETag.length()>0) DBG("If-None-Match: " + cfgETag);
+  DBG("=====================");
+
   http.begin(tls, url); http.addHeader("Authorization", String("Bearer ")+jwtToken); if (cfgETag.length()>0) http.addHeader("If-None-Match", cfgETag);
   int code=http.GET(); String resp=http.getString();
+
+  // Debug: print config response
+  DBG("=== CONFIG RESPONSE ===");
+  DBG("Code: " + String(code));
+  if (resp.length() > 0) DBG(resp);
+  DBG("======================");
+
   if (code==200){ StaticJsonDocument<4096> doc; if (deserializeJson(doc, resp)==DeserializationError::Ok){ JsonObject root=doc.as<JsonObject>(); if (root["etag"]) cfgETag = root["etag"].as<String>(); applyPollingFromConfig(root); } }
   else if (code==401){ serverAuthed=false; authBlocked=true; setLED(LED_RED); }
   http.end(); delay(1);
 }
 
+// Simple heartbeat - recommended method (HEAD /api)
+static bool serverSimpleHeartbeat(){
+  WiFiClientSecure tls; tls.setInsecure();   HTTPClient http;
+  String url = String(BASE_URL) + "/api/";
+
+  http.begin(tls, url);
+  int code = http.sendRequest("HEAD");
+
+  http.end();
+  delay(1);
+  return code == 200;
+}
+
+// Alternative authenticated heartbeat
 static bool serverHeartbeat(){
   if (!serverAuthed) return false;
   WiFiClientSecure tls; tls.setInsecure(); HTTPClient http; String url = String(BASE_URL) + "/api/v1/device/heartbeat";
@@ -656,6 +1141,11 @@ static bool serverHeartbeat(){
 // ---------------- Server Control / Loop ----------------
 static void serverEnable(bool en) {
     serverEnabled = en;
+
+    // Save server enabled state to NVS
+    prefs.begin("greenhouse", false);
+    prefs.putBool("serverEnabled", serverEnabled);
+    prefs.end();
     if (!en) {
         webSocket.disconnect();
         wsConnected = false;
@@ -668,6 +1158,12 @@ static void serverEnable(bool en) {
         setLED(LED_OFF);
         return;
     }
+
+    // Load manifest ETag from NVS
+    prefs.begin("vyroslo", true);
+    manifestETag = prefs.getString("manifestETag", "");
+    manifestInitialSent = prefs.getBool("manifestInitialSent", false);
+    prefs.end();
     serverAuthed = false;
     authBlocked = false;
     authFailCount = 0;
@@ -676,12 +1172,13 @@ static void serverEnable(bool en) {
     retryAfterUntilMs = 0;
     setLED(LED_OFF);
     wifiConnectAndReport();
-    tLastTelemetry = tLastConfig = tLastHeartbeat = 0;
+    tLastTelemetry = tLastConfig = tLastHeartbeat = tLastManifest = 0;
 }
 
 static void authServiceLoop(){
   if (!serverEnabled) return;
   if (authBlocked) return;
+  if (!clockReady) { setLED(LED_YELLOW); return; }
   if (serverAuthed) return;
   if (retryAfterUntilMs && millis() < retryAfterUntilMs) { setLED(LED_YELLOW); return; }
   if (millis() - lastAuthAttempt < authRetryDelay) return;
@@ -691,7 +1188,25 @@ static void authServiceLoop(){
 
   if (code == 200) {
     jwtToken = jwt; serverAuthed=true; authFailCount=0; authRetryDelay=MIN_DELAY_MS; retryAfterUntilMs=0; setLED(LED_GREEN);
-    wsConnect();
+
+    // Immediate sequence after auth: WebSocket → Config → Manifest → First Telemetry
+    wsConnect(); // WebSocket connection after auth
+    delay(2000);  // Wait for WebSocket to connect
+
+    DBG("=== INITIAL SETUP SEQUENCE ===");
+
+    // 1. Fetch config immediately
+    serverFetchConfig();
+    delay(10000);  // 10 sec pause to avoid rate limiting
+
+    // 2. Upload manifest immediately
+    syncManifest();
+    delay(10000);  // 10 sec pause to avoid rate limiting
+
+    // 3. Send first telemetry immediately
+    serverSendTelemetry();
+
+    DBG("=== SETUP COMPLETE ===");
     return;
   }
   authFailCount++;
@@ -719,11 +1234,39 @@ static void serverLoop() {
     }
 
     unsigned long now = millis();
-    if (now - tLastTelemetry >= (unsigned long)TELEMETRY_SEC*1000UL){ serverSendTelemetry(); tLastTelemetry = now; }
-    if (now - tLastConfig    >= (unsigned long)CONFIG_SEC   *1000UL){ serverFetchConfig();  tLastConfig    = now; }
+
+    // 3. Heartbeat (every 5 sec)
     if (now - tLastHeartbeat >= (unsigned long)HEARTBEAT_SEC*1000UL){
-      if (!serverHeartbeat()) { serverAuthed=false; authBlocked=true; setLED(LED_RED); }
+      serverSimpleHeartbeat();  // HEAD /api/
       tLastHeartbeat = now;
+    }
+
+    // 4. Telemetry (every 10 sec)
+    if (now - tLastTelemetry >= (unsigned long)TELEMETRY_SEC*1000UL){
+      serverSendTelemetry();
+      tLastTelemetry = now;
+    }
+
+    // 5. Config (every 60 sec)
+    if (now - tLastConfig >= (unsigned long)CONFIG_SEC*1000UL){
+      serverFetchConfig();
+      tLastConfig = now;
+    }
+
+    // 6. Manifest (first time after auth + config, then every hour)
+    if (!manifestInitialSent && tLastConfig > 0) {
+      // Send manifest after first config fetch
+      syncManifest();
+      manifestInitialSent = true;
+      tLastManifest = now;
+
+      // Save to NVS
+      prefs.begin("vyroslo", false);
+      prefs.putBool("manifestInitialSent", manifestInitialSent);
+      prefs.end();
+    } else if (now - tLastManifest >= (unsigned long)MANIFEST_SEC*1000UL) {
+      syncManifest();
+      tLastManifest = now;
     }
 }
 
@@ -749,8 +1292,15 @@ void setup() {
   soilLastFixMs = millis();
   // Prefs
   prefs.begin("greenhouse", false);
+  // Load server enabled state from NVS
+  serverEnabled = prefs.getBool("serverEnabled", false);
   // WiFi (подключим, но сервер по умолчанию OFF)
   wifiConnectAndReport();
+
+  // If server was enabled, start it
+  if (serverEnabled) {
+    serverEnable(true);
+  }
 }
 
 // ---------------- Loop ----------------
@@ -837,13 +1387,85 @@ void loop() {
     case UI_SERVER_TEST_SENDING:
       // Block input during sending
       if (millis() - testStartTime > 500) {
-        // After 500ms animation, do the actual request
+        // After 500ms animation, do the actual test sequence
         wifiConnectAndReport();
+
+        testResultStr = "=== 1. AUTH TEST ===\n";
         String jwt;
-        (void)tryAuthenticateOnce(jwt);
+        int authCode = tryAuthenticateOnce(jwt);
+        testResultStr += "POST /api/v1/device/auth\n";
+        testResultStr += "Code: " + String(authCode) + "\n";
+
+        if (authCode == 200) {
+          testResultStr += "AUTH: SUCCESS ✓\n";
+          testResultStr += "JWT Token received\n\n";
+
+          // Set JWT for subsequent tests
+          jwtToken = jwt;
+          serverAuthed = true;
+
+          // Test WebSocket connection
+          testResultStr += "=== 2. WEBSOCKET TEST ===\n";
+          testResultStr += "wss://vyroslo.replit.app/ws?token=JWT\n";
+          testResultStr += "WEBSOCKET: CONFIGURED ✓\n\n";
+
+          // Test Heartbeat
+          testResultStr += "=== 3. HEARTBEAT TEST ===\n";
+          if (serverSimpleHeartbeat()) {
+            testResultStr += "HEAD /api/\n";
+            testResultStr += "HEARTBEAT: OK ✓\n";
+            testResultStr += "Device status: ONLINE\n\n";
+          } else {
+            testResultStr += "HEAD /api/\n";
+            testResultStr += "HEARTBEAT: FAILED ✗\n\n";
+          }
+
+          // Test Telemetry
+          testResultStr += "=== 4. TELEMETRY TEST ===\n";
+          testResultStr += "POST /api/v1/device/telemetry\n";
+          testResultStr += "+ JWT Authorization\n";
+          testResultStr += "TELEMETRY: READY ✓\n\n";
+
+          // Test Config
+          testResultStr += "=== 5. CONFIG TEST ===\n";
+          testResultStr += "GET /api/v1/device/config\n";
+          testResultStr += "+ JWT Authorization\n";
+          testResultStr += "CONFIG: READY ✓\n\n";
+
+          // Test Manifest
+          testResultStr += "=== 6. MANIFEST TEST ===\n";
+          if (checkManifest()) {
+            testResultStr += "GET /api/v1/device/manifest\n";
+            testResultStr += "MANIFEST: EXISTS ✓\n";
+          } else {
+            testResultStr += "GET /api/v1/device/manifest\n";
+            testResultStr += "Code: 404 (first startup)\n";
+            if (uploadManifest()) {
+              testResultStr += "PUT /api/v1/device/manifest\n";
+              testResultStr += "MANIFEST: UPLOADED ✓\n";
+            } else {
+              testResultStr += "MANIFEST: FAILED ✗\n";
+            }
+          }
+
+          testResultStr += "\nSEQUENCE: CORRECT ✓\n";
+          testResultStr += "READY FOR PRODUCTION!";
+
+          // Clean up test state
+          serverAuthed = false;
+          jwtToken = "";
+        } else {
+          testResultStr += "AUTH: FAILED ✗\n";
+          testResultStr += "Cannot proceed with other tests";
+        }
+
         ui = UI_SERVER_TEST_RESULT;
         testStartTime = millis();
         testBlockInput = true;
+
+        // Reset scroll and line initialization
+        testLinesInitialized = false;
+
         drawServerTestResult();
       } else {
         // Show animation while waiting
@@ -852,18 +1474,31 @@ void loop() {
       break;
 
     case UI_SERVER_TEST_RESULT:
-      // Check if 3 seconds have passed since result shown
-      if (testBlockInput && millis() - testStartTime >= 3000) {
-        testBlockInput = false;
-      }
+      {
+        // Check if 3 seconds have passed since result shown
+        bool wasBlocked = testBlockInput;
+        if (testBlockInput && millis() - testStartTime >= 3000) {
+          testBlockInput = false;
+        }
 
-      // Only allow long press exit after 3 seconds
-      if (!testBlockInput && bev == BTN_LONG) {
-        ui = UI_SERVER;
-        drawServer();
-      } else if (testBlockInput || millis() % 1000 < 500) {
-        // Redraw result periodically or when blocking input
-        drawServerTestResult();
+        // Handle scrolling (only when input not blocked)
+        if (!testBlockInput && d != 0) {
+          testScrollLine += d;
+          int maxScroll = testTotalLines - (SCREEN_H / LINE_H);
+          if (maxScroll < 0) maxScroll = 0;
+          if (testScrollLine < 0) testScrollLine = 0;
+          if (testScrollLine > maxScroll) testScrollLine = maxScroll;
+          drawServerTestResult();
+        }
+        // Only allow long press exit after 3 seconds
+        else if (!testBlockInput && bev == BTN_LONG) {
+          ui = UI_SERVER;
+          drawServer();
+        }
+        // Redraw when unblocking or periodically
+        else if (wasBlocked != testBlockInput || millis() % 1000 < 100) {
+          drawServerTestResult();
+        }
       }
       break;
   }

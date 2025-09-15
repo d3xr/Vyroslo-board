@@ -14,7 +14,9 @@
       "Bash(git commit:*)",
       "Bash(gh repo create:*)",
       "Bash(git remote add:*)",
-      "Bash(git branch:*)"
+      "Bash(git branch:*)",
+      "Bash(platformio run:*)",
+      "Bash(\"C:\\Users\\d3xr\\.platformio\\penv\\Scripts\\platformio.exe\" device list)"
     ],
     "deny": [],
     "ask": []
